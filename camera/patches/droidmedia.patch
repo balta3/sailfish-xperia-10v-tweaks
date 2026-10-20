@@ -1,0 +1,57 @@
+diff --git a/AsyncCodecSource.cpp b/AsyncCodecSource.cpp
+index 2860d2e..fd7b37e 100644
+--- a/AsyncCodecSource.cpp
++++ b/AsyncCodecSource.cpp
+@@ -473,8 +473,20 @@ void AsyncCodecSource::onMessageReceived(const sp<AMessage> &msg) {
+             memcpy(buffer->data(), out_buffer->data(), out_buffer->size());
+ #if ANDROID_MAJOR >= 9
+             buffer->meta_data().setInt64(kKeyTime, timeUs);
++            if (flags & MediaCodec::BUFFER_FLAG_CODECCONFIG) {
++                buffer->meta_data().setInt32(kKeyIsCodecConfig, 1);
++            }
++            if (flags & MediaCodec::BUFFER_FLAG_SYNCFRAME) {
++                buffer->meta_data().setInt32(kKeyIsSyncFrame, 1);
++            }
+ #else
+             buffer->meta_data()->setInt64(kKeyTime, timeUs);
++            if (flags & MediaCodec::BUFFER_FLAG_CODECCONFIG) {
++                buffer->meta_data()->setInt32(kKeyIsCodecConfig, 1);
++            }
++            if (flags & MediaCodec::BUFFER_FLAG_SYNCFRAME) {
++                buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
++            }
+ #endif
+             Mutexed<Output>::Locked me(mOutput);
+             me->mBufferQueue.push_back(buffer);
+diff --git a/droidmediabuffer.cpp b/droidmediabuffer.cpp
+index 64a94eb..1f3d697 100644
+--- a/droidmediabuffer.cpp
++++ b/droidmediabuffer.cpp
+@@ -48,6 +48,7 @@ _DroidMediaBuffer::_DroidMediaBuffer(DroidMediaBufferItem& buffer,
+     format = buffer.mGraphicBuffer->format;
+     usage  = buffer.mGraphicBuffer->usage;
+     handle = buffer.mGraphicBuffer->handle;
++    layerCount = 1;
+ 
+     common.incRef = incRef;
+     common.decRef = decRef;
+@@ -69,6 +70,7 @@ _DroidMediaBuffer::_DroidMediaBuffer(android::sp<android::GraphicBuffer>& buffer
+     format = m_buffer->format;
+     usage  = m_buffer->usage;
+     handle = m_buffer->handle;
++    layerCount = 1;
+ 
+     common.incRef = incRef;
+     common.decRef = decRef;
+diff --git a/private.cpp b/private.cpp
+index e307b97..a2ab22c 100644
+--- a/private.cpp
++++ b/private.cpp
+@@ -136,6 +136,7 @@ void _DroidMediaBufferQueue::attachToCameraPreview(android::sp<android::Camera>&
+ 
+ void _DroidMediaBufferQueue::attachToCameraVideo(android::sp<android::Camera>& camera) {
+ #if ANDROID_MAJOR >= 9
++    m_queue->setConsumerUsageBits(android::GraphicBuffer::USAGE_HW_VIDEO_ENCODER);
+     camera->setVideoTarget(m_producer);
+ #endif
+ }

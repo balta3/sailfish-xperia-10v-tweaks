@@ -1,0 +1,305 @@
+diff --git a/drivers/Makefile b/drivers/Makefile
+index c07fb7ae..275bdf4f 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -172,6 +172,11 @@ camera-$(CONFIG_SPECTRA_SENSOR) += \
+ 	cam_sensor_module/cam_sensor_utils/cam_sensor_util.o \
+ 	cam_sensor_module/cam_res_mgr/cam_res_mgr.o
+ 
++ifeq ($(CONFIG_ARCH_SONY_ZAMBEZI),y)
++camera-$(CONFIG_SPECTRA_SENSOR) += \
++	cam_sensor_module/cam_ois_dw9784/dw9784_safe.o
++endif
++
+ camera-$(CONFIG_LEDS_QPNP_FLASH_V2) += \
+ 	cam_sensor_module/cam_flash/cam_flash_dev.o \
+ 	cam_sensor_module/cam_flash/cam_flash_core.o \
+diff --git a/drivers/cam_sensor_module/cam_ois/cam_ois_core.c b/drivers/cam_sensor_module/cam_ois/cam_ois_core.c
+index b8cc002e..4544986f 100644
+--- a/drivers/cam_sensor_module/cam_ois/cam_ois_core.c
++++ b/drivers/cam_sensor_module/cam_ois/cam_ois_core.c
+@@ -14,6 +14,9 @@
+ #include "cam_res_mgr_api.h"
+ #include "cam_common_util.h"
+ #include "cam_packet_util.h"
++#if defined(CONFIG_ARCH_SONY_ZAMBEZI)
++#include "../cam_ois_dw9784/dw9784_safe.h"
++#endif
+ 
+ int32_t cam_ois_construct_default_power_setting(
+ 	struct cam_sensor_power_ctrl_t *power_info)
+@@ -648,14 +651,30 @@ static int cam_ois_pkt_parse(struct cam_ois_ctrl_t *o_ctrl, void *arg)
+ 			}
+ 		}
+ 
+-		rc = cam_ois_apply_settings(o_ctrl, &o_ctrl->i2c_init_data);
+-		if ((rc == -EAGAIN) &&
+-			(o_ctrl->io_master_info.master_type == CCI_MASTER)) {
++		if (!strcmp(o_ctrl->ois_name, "dw9784")) {
+ 			CAM_WARN(CAM_OIS,
+-				"CCI HW is restting: Reapplying INIT settings");
+-			usleep_range(1000, 1010);
++				"DW9784-SAFE: replacing broken generic INIT");
++
++		#if defined(CONFIG_ARCH_SONY_ZAMBEZI)
++			rc = dw9784_safe_open_camera(o_ctrl);
++		#else
++			CAM_ERR(CAM_OIS,
++				"DW9784-SAFE: ZAMBEZI support not compiled");
++			rc = -ENODEV;
++		#endif
++		} else {
+ 			rc = cam_ois_apply_settings(o_ctrl,
+ 				&o_ctrl->i2c_init_data);
++
++			if ((rc == -EAGAIN) &&
++				(o_ctrl->io_master_info.master_type ==
++				CCI_MASTER)) {
++				CAM_WARN(CAM_OIS,
++					"CCI HW is restting: Reapplying INIT settings");
++				usleep_range(1000, 1010);
++				rc = cam_ois_apply_settings(o_ctrl,
++					&o_ctrl->i2c_init_data);
++			}
+ 		}
+ 		if (rc < 0) {
+ 			CAM_ERR(CAM_OIS,
+diff --git a/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.c b/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.c
+new file mode 100644
+index 00000000..d39b28b3
+--- /dev/null
++++ b/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.c
+@@ -0,0 +1,219 @@
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++
++#include "cam_sensor_i2c.h"
++#include "cam_debug_util.h"
++
++#include "../cam_ois/cam_ois_dev.h"
++#include "dw9784_safe.h"
++
++static int dw9784_safe_write16(struct cam_ois_ctrl_t *o_ctrl,
++uint32_t reg_addr, uint32_t reg_data)
++{
++struct cam_sensor_i2c_reg_setting setting = {0};
++struct cam_sensor_i2c_reg_array reg = {0};
++int rc;
++
++reg.reg_addr = reg_addr;
++reg.reg_data = reg_data;
++reg.delay = 0;
++reg.data_mask = 0;
++
++setting.reg_setting = &reg;
++setting.size = 1;
++setting.addr_type = CAMERA_SENSOR_I2C_TYPE_WORD;
++setting.data_type = CAMERA_SENSOR_I2C_TYPE_WORD;
++setting.delay = 0;
++setting.read_buff = NULL;
++setting.read_buff_len = 0;
++
++rc = camera_io_dev_write(&o_ctrl->io_master_info, &setting);
++if (rc < 0)
++CAM_ERR(CAM_OIS,
++"DW9784-SAFE: write 0x%04x=0x%04x failed rc=%d",
++reg_addr, reg_data, rc);
++
++return rc;
++}
++
++static int dw9784_safe_read16(struct cam_ois_ctrl_t *o_ctrl,
++uint32_t reg_addr, uint16_t *reg_data)
++{
++uint8_t data[2] = {0};
++int rc;
++
++rc = camera_io_dev_read_seq(&o_ctrl->io_master_info,
++reg_addr,
++data,
++CAMERA_SENSOR_I2C_TYPE_WORD,
++CAMERA_SENSOR_I2C_TYPE_BYTE,
++2);
++
++if (rc < 0) {
++CAM_ERR(CAM_OIS,
++"DW9784-SAFE: read 0x%04x failed rc=%d",
++reg_addr, rc);
++return rc;
++}
++
++*reg_data = ((uint16_t)data[0] << 8) | data[1];
++
++return 0;
++}
++
++int dw9784_safe_open_camera(struct cam_ois_ctrl_t *o_ctrl)
++{
++uint16_t second_id = 0;
++uint16_t chip_id = 0;
++uint16_t fw_version = 0;
++uint16_t fw_date = 0;
++uint16_t checksum_status = 0;
++uint16_t ois_status = 0;
++uint16_t gyro_id = 0;
++int rc;
++
++if (!o_ctrl)
++return -EINVAL;
++
++CAM_WARN(CAM_OIS,
++"DW9784-SAFE: begin non-flashing initialization");
++
++/*
++ * This sequence comes from the Xperia 10 V DW9784 driver.
++ * It does NOT erase/write OIS firmware and does NOT persist
++ * calibration data.
++ */
++
++/* Chip enable */
++rc = dw9784_safe_write16(o_ctrl, 0xD000, 0x0001);
++if (rc < 0)
++return rc;
++
++mdelay(4);
++
++/* DSP off while checking chip */
++rc = dw9784_safe_write16(o_ctrl, 0xD001, 0x0000);
++if (rc < 0)
++return rc;
++
++mdelay(1);
++
++/* Release protection, as done by dw9784_flash_acess().
++ * No flash erase/write command is issued here.
++ */
++rc = dw9784_safe_write16(o_ctrl, 0xFAFA, 0x98AC);
++if (rc < 0)
++return rc;
++
++mdelay(1);
++
++rc = dw9784_safe_write16(o_ctrl, 0xF053, 0x70BD);
++if (rc < 0)
++return rc;
++
++mdelay(1);
++
++/* Internal/second chip ID */
++rc = dw9784_safe_read16(o_ctrl, 0xD060, &second_id);
++if (rc < 0)
++return rc;
++
++CAM_WARN(CAM_OIS,
++"DW9784-SAFE: second_id=0x%04x expected=0x0020",
++second_id);
++
++if (second_id != 0x0020) {
++CAM_ERR(CAM_OIS,
++"DW9784-SAFE: invalid second chip id");
++dw9784_safe_write16(o_ctrl, 0xD000, 0x0000);
++return -ENODEV;
++}
++
++/*
++ * Sony/Lineage DW9784 startup writes this before reset.
++ */
++rc = dw9784_safe_write16(o_ctrl, 0x70DA, 0x1002);
++if (rc < 0)
++return rc;
++
++/* Logic reset */
++rc = dw9784_safe_write16(o_ctrl, 0xD002, 0x0001);
++if (rc < 0)
++return rc;
++
++mdelay(4);
++
++/* DSP active */
++rc = dw9784_safe_write16(o_ctrl, 0xD001, 0x0001);
++if (rc < 0)
++return rc;
++
++mdelay(25);
++
++/* User protection release */
++rc = dw9784_safe_write16(o_ctrl, 0xEBF1, 0x56FA);
++if (rc < 0)
++return rc;
++
++/*
++ * From this point on we only inspect state.
++ * No firmware update, calibration or store operation.
++ */
++rc = dw9784_safe_read16(o_ctrl, 0x7000, &chip_id);
++if (rc < 0)
++return rc;
++
++rc = dw9784_safe_read16(o_ctrl, 0x7001, &fw_version);
++if (rc < 0)
++return rc;
++
++rc = dw9784_safe_read16(o_ctrl, 0x7002, &fw_date);
++if (rc < 0)
++return rc;
++
++rc = dw9784_safe_read16(o_ctrl, 0x700D, &checksum_status);
++if (rc < 0)
++return rc;
++
++rc = dw9784_safe_read16(o_ctrl, 0x7010, &ois_status);
++if (rc < 0)
++return rc;
++
++rc = dw9784_safe_read16(o_ctrl, 0x7194, &gyro_id);
++if (rc < 0)
++return rc;
++
++CAM_WARN(CAM_OIS,
++"DW9784-SAFE: chip=0x%04x fw=0x%04x date=0x%04x checksum_status=0x%04x status=0x%04x gyro=0x%04x",
++chip_id, fw_version, fw_date,
++checksum_status, ois_status, gyro_id);
++
++if (chip_id != 0x9784) {
++CAM_ERR(CAM_OIS,
++"DW9784-SAFE: unexpected chip id 0x%04x",
++chip_id);
++return -ENODEV;
++}
++
++/*
++ * Bit 0 is the firmware checksum-error indication used by
++ * Sony's DW9784 driver. Do NOT auto-repair it in this test.
++ */
++if (checksum_status & 0x0001) {
++CAM_ERR(CAM_OIS,
++"DW9784-SAFE: firmware checksum error; refusing automatic firmware update");
++return -EIO;
++}
++
++if (gyro_id != 0x0006)
++CAM_WARN(CAM_OIS,
++"DW9784-SAFE: gyro id is 0x%04x, Xperia driver expects BMI260 (6); not modifying it",
++gyro_id);
++
++CAM_WARN(CAM_OIS,
++"DW9784-SAFE: initialization complete, no persistent writes performed");
++
++return 0;
++}
+diff --git a/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.h b/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.h
+new file mode 100644
+index 00000000..ef9693b9
+--- /dev/null
++++ b/drivers/cam_sensor_module/cam_ois_dw9784/dw9784_safe.h
+@@ -0,0 +1,8 @@
++#ifndef _DW9784_SAFE_H_
++#define _DW9784_SAFE_H_
++
++#include "../cam_ois/cam_ois_dev.h"
++
++int dw9784_safe_open_camera(struct cam_ois_ctrl_t *o_ctrl);
++
++#endif

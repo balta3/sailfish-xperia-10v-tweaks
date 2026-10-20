@@ -1,0 +1,488 @@
+diff --git a/gst-libs/gst/droid/gstdroidcodec.c b/gst-libs/gst/droid/gstdroidcodec.c
+index 09e41a9..92641d9 100644
+--- a/gst-libs/gst/droid/gstdroidcodec.c
++++ b/gst-libs/gst/droid/gstdroidcodec.c
+@@ -252,9 +252,20 @@ gst_droid_codec_get_all_caps (GstDroidCodecType type)
+       md.flags = DROID_MEDIA_CODEC_HW_ONLY;
+       if (!droid_media_codec_is_supported (&md,
+               type == GST_DROID_CODEC_ENCODER_VIDEO)) {
+-        GST_INFO ("No hardware support found for %s, disabling codec",
+-            codecs[x].droid);
+-        continue;
++        /*
++         * Android 14 hybris can return an empty MediaCodecList result for
++         * HW_ONLY encoder probing even though the codec can still be created.
++         * Keep H.264 visible so encodebin can instantiate droidvenc and let
++         * the real MediaCodec creation path decide whether it is usable.
++         */
++        if (type == GST_DROID_CODEC_ENCODER_VIDEO &&
++            g_strcmp0 (codecs[x].droid, "video/avc") == 0) {
++          GST_WARNING ("H.264 HW support probe failed; advertising encoder for runtime validation");
++        } else {
++          GST_INFO ("No hardware support found for %s, disabling codec",
++              codecs[x].droid);
++          continue;
++        }
+       }
+     }
+ 
+diff --git a/gst-libs/gst/droid/gstdroidmediabuffer.c b/gst-libs/gst/droid/gstdroidmediabuffer.c
+index 50ee096..03f48c8 100644
+--- a/gst-libs/gst/droid/gstdroidmediabuffer.c
++++ b/gst-libs/gst/droid/gstdroidmediabuffer.c
+@@ -296,8 +296,11 @@ gst_droid_media_buffer_allocator_alloc (GstAllocator * allocator,
+   mem->video_info.size = size;
+ 
+   // Android YV12 requires alignment of the UV stride too.
+-  // So we need to reset the gst UV strides and offsets.
+-  if (gst_droid_media_buffer_formats[format_index].gst_format ==
++  // So we need to reset the gst UV strides and offsets. Unknown HAL formats
++  // deliberately use GST_VIDEO_FORMAT_ENCODED above and have no format-map
++  // entry to inspect here.
++  if (format_index != GST_DROID_MEDIA_BUFFER_FORMAT_COUNT &&
++      gst_droid_media_buffer_formats[format_index].gst_format ==
+       GST_VIDEO_FORMAT_YV12) {
+     gsize uvStride = ALIGN_SIZE (stride / 2,
+         gst_droid_media_buffer_formats[format_index].h_align);
+diff --git a/gst-libs/gst/droid/gstwrappedmemory.h b/gst-libs/gst/droid/gstwrappedmemory.h
+index 33acf24..e862e8d 100644
+--- a/gst-libs/gst/droid/gstwrappedmemory.h
++++ b/gst-libs/gst/droid/gstwrappedmemory.h
+@@ -29,6 +29,16 @@ G_BEGIN_DECLS
+ #define GST_ALLOCATOR_WRAPPED_MEMORY                    "WrappedMemory"
+ #define GST_CAPS_FEATURE_MEMORY_DROID_VIDEO_META_DATA   "memory:DroidVideoMetaData"
+ 
++/* Android VideoNativeMetadata / MetadataBufferType ABI. */
++#define GST_DROID_VIDEO_METADATA_TYPE_ANW_BUFFER        2
++
++typedef struct
++{
++  gint32 e_type;
++  gpointer p_buffer;
++  gint n_fence_fd;
++} GstDroidVideoNativeMetadata;
++
+ GstAllocator * gst_wrapped_memory_allocator_new (void);
+ 
+ gboolean       gst_is_wrapped_memory_memory (GstMemory * mem);
+diff --git a/gst/droidcamsrc/gstdroidcamsrc.c b/gst/droidcamsrc/gstdroidcamsrc.c
+index 8ae002a..b39f73d 100644
+--- a/gst/droidcamsrc/gstdroidcamsrc.c
++++ b/gst/droidcamsrc/gstdroidcamsrc.c
+@@ -2018,6 +2018,11 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
+ 
+   gst_droidcamsrc_recorder_update_vid (src->dev->recorder, &info, our_caps);
+ 
++  if (!src->dev->use_recorder &&
++      !gst_droidcamsrc_dev_configure_recording_pool (src->dev, &info)) {
++    GST_WARNING_OBJECT (src, "Failed to configure recording buffer pool");
++  }
++
+ out:
+   if (peer) {
+     gst_caps_unref (peer);
+@@ -2631,11 +2636,26 @@ gst_droidcamsrc_get_video_caps_locked (GstDroidCamSrc * src)
+   }
+ 
+   GstCaps *tpl = gst_droidcamsrc_params_get_video_caps (src->dev->params);
+-  GstCaps *caps = gst_caps_new_empty ();
+-  GstCaps *encoded =
+-      gst_droid_codec_get_all_caps (GST_DROID_CODEC_ENCODER_VIDEO);
++  GstCaps *caps;
++  GstCaps *encoded;
+   int x;
+ 
++  /*
++   * Android 14 Camera2 recording is delivered through the dedicated
++   * recording BufferQueue.  Advertising already-encoded video here makes
++   * camerabin choose the legacy external-recorder path (use_recorder=TRUE),
++   * bypassing that queue entirely and causing long start/stop stalls.
++   *
++   * When a recording queue exists, expose only the raw metadata caps so the
++   * droidvenc path consumes our VideoNativeMetadata buffers.
++   */
++  if (src->dev->recording_queue) {
++    return gst_caps_simplify (tpl);
++  }
++
++  caps = gst_caps_new_empty ();
++  encoded = gst_droid_codec_get_all_caps (GST_DROID_CODEC_ENCODER_VIDEO);
++
+   struct Data data;
+   data.result = caps;
+ 
+diff --git a/gst/droidcamsrc/gstdroidcamsrcdev.c b/gst/droidcamsrc/gstdroidcamsrcdev.c
+index 4fc1c95..c3cc314 100644
+--- a/gst/droidcamsrc/gstdroidcamsrcdev.c
++++ b/gst/droidcamsrc/gstdroidcamsrcdev.c
+@@ -39,6 +39,7 @@
+ #include "gstdroidcamsrcexif.h"
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
++#include <unistd.h>
+ 
+ GST_DEBUG_CATEGORY_EXTERN (gst_droid_camsrc_debug);
+ #define GST_CAT_DEFAULT gst_droid_camsrc_debug
+@@ -69,6 +70,25 @@ typedef struct _GstDroidCamSrcDevVideoData
+   DroidMediaCameraRecordingData *data;
+ } GstDroidCamSrcDevVideoData;
+ 
++typedef struct _GstDroidCamSrcRecordingMetadata
++{
++  GstDroidVideoNativeMetadata metadata;
++  GstBuffer *queue_buffer;
++} GstDroidCamSrcRecordingMetadata;
++
++static void
++gst_droidcamsrc_dev_release_recording_metadata (void *data, gpointer user_data)
++{
++  GstDroidCamSrcRecordingMetadata *recording =
++      (GstDroidCamSrcRecordingMetadata *) user_data;
++
++  if (recording->metadata.n_fence_fd >= 0)
++    close (recording->metadata.n_fence_fd);
++
++  gst_buffer_unref (recording->queue_buffer);
++  g_slice_free (GstDroidCamSrcRecordingMetadata, recording);
++}
++
+ static void gst_droidcamsrc_dev_release_recording_frame (void *data,
+     GstDroidCamSrcDevVideoData * video_data);
+ void gst_droidcamsrc_dev_update_params_locked (GstDroidCamSrcDev * dev);
+@@ -522,6 +542,96 @@ gst_droidcamsrc_dev_frame_available (void *user, DroidMediaBuffer * buffer)
+   return true;
+ }
+ 
++
++static void
++gst_droidcamsrc_dev_recording_buffers_released (void *user)
++{
++  GstDroidCamSrcDev *dev = (GstDroidCamSrcDev *) user;
++
++
++  if (dev->video_pool)
++    gst_droid_buffer_pool_media_buffers_invalidated (dev->video_pool);
++}
++
++static bool
++gst_droidcamsrc_dev_recording_buffer_created (void *user,
++    DroidMediaBuffer * buffer)
++{
++  GstDroidCamSrcDev *dev = (GstDroidCamSrcDev *) user;
++  gboolean ret = FALSE;
++
++  if (dev->video_pool)
++    ret = gst_droid_buffer_pool_bind_media_buffer (dev->video_pool, buffer);
++
++
++  return ret;
++}
++
++static bool
++gst_droidcamsrc_dev_recording_frame_available (void *user,
++    DroidMediaBuffer * buffer)
++{
++  GstDroidCamSrcDev *dev = (GstDroidCamSrcDev *) user;
++  GstBuffer *gst_buffer = NULL;
++  GstBuffer *metadata_buffer = NULL;
++  GstMemory *metadata_memory;
++  GstDroidCamSrcRecordingMetadata *recording;
++
++  if (dev->video_pool)
++    gst_buffer = gst_droid_buffer_pool_acquire_media_buffer (dev->video_pool,
++        buffer);
++
++  if (!gst_buffer) {
++    GST_WARNING ("Failed to acquire camera recording buffer");
++    return false;
++  }
++
++
++  /*
++   * Android >= 9 records through a BufferQueue.  The droid video encoder
++   * expects Android VideoNativeMetadata rather than the YUV payload itself.
++   * DroidMediaBuffer inherits ANativeWindowBuffer, so the buffer pointer is
++   * the ANWBuffer pointer required by the metadata ABI.
++   *
++   * Keep the queue GstBuffer referenced by the wrapped metadata memory.  It
++   * is returned to the camera queue only after the encoder releases the input
++   * GstBuffer.  n_fence_fd starts at -1; fence-aware recycling will be added
++   * in droidmedia once the basic ANW metadata path is proven.
++   */
++  recording = g_slice_new0 (GstDroidCamSrcRecordingMetadata);
++  recording->metadata.e_type = GST_DROID_VIDEO_METADATA_TYPE_ANW_BUFFER;
++  recording->metadata.p_buffer = buffer;
++  recording->metadata.n_fence_fd = -1;
++  recording->queue_buffer = gst_buffer;
++
++  metadata_buffer = gst_buffer_new ();
++  metadata_memory = gst_wrapped_memory_allocator_wrap (dev->wrap_allocator,
++      &recording->metadata, sizeof (recording->metadata),
++      (GFunc) gst_droidcamsrc_dev_release_recording_metadata, recording);
++  gst_buffer_insert_memory (metadata_buffer, 0, metadata_memory);
++
++  gst_droidcamsrc_timestamp (
++      GST_DROIDCAMSRC (GST_PAD_PARENT (dev->imgsrc->pad)), metadata_buffer);
++
++  g_mutex_lock (&dev->vid->lock);
++  GST_BUFFER_OFFSET (metadata_buffer) = dev->vid->video_frames;
++  GST_BUFFER_OFFSET_END (metadata_buffer) = ++dev->vid->video_frames;
++
++  if (!dev->vid->running) {
++    gst_buffer_unref (metadata_buffer);
++  } else {
++    g_mutex_lock (&dev->vidsrc->lock);
++    g_queue_push_tail (dev->vidsrc->queue, metadata_buffer);
++    g_cond_signal (&dev->vidsrc->cond);
++    g_mutex_unlock (&dev->vidsrc->lock);
++  }
++
++  g_cond_signal (&dev->vid->cond);
++  g_mutex_unlock (&dev->vid->lock);
++
++  return true;
++}
++
+ GstDroidCamSrcDev *
+ gst_droidcamsrc_dev_new (GstDroidCamSrcPad * vfsrc,
+     GstDroidCamSrcPad * imgsrc, GstDroidCamSrcPad * vidsrc, GRecMutex * lock)
+@@ -533,6 +643,7 @@ gst_droidcamsrc_dev_new (GstDroidCamSrcPad * vfsrc,
+   dev = g_slice_new0 (GstDroidCamSrcDev);
+   dev->cam = NULL;
+   dev->queue = NULL;
++  dev->recording_queue = NULL;
+   dev->running = FALSE;
+   dev->use_raw_data = FALSE;
+   dev->info = NULL;
+@@ -551,6 +662,7 @@ gst_droidcamsrc_dev_new (GstDroidCamSrcPad * vfsrc,
+   dev->lock = lock;
+ 
+   dev->pool = NULL;
++  dev->video_pool = NULL;
+ 
+   dev->last_preview_buffer = NULL;
+   g_mutex_init (&dev->last_preview_buffer_lock);
+@@ -609,11 +721,16 @@ gst_droidcamsrc_dev_open (GstDroidCamSrcDev * dev, GstDroidCamSrcCamInfo * info)
+   }
+ 
+   dev->queue = droid_media_camera_get_buffer_queue (dev->cam);
++  dev->recording_queue =
++      droid_media_camera_get_recording_buffer_queue (dev->cam);
++
+ 
+   if (!droid_media_camera_lock (dev->cam)) {
+     droid_media_camera_disconnect (dev->cam);
+     dev->cam = NULL;
+     dev->queue = NULL;
++    dev->recording_queue = NULL;
++    dev->recording_queue = NULL;
+ 
+     GST_ELEMENT_ERROR (src, LIBRARY, INIT, (NULL), ("error locking camera"));
+     return FALSE;
+@@ -658,6 +775,11 @@ gst_droidcamsrc_dev_destroy (GstDroidCamSrcDev * dev)
+   gst_object_unref (dev->media_allocator);
+   dev->media_allocator = NULL;
+ 
++  if (dev->video_pool) {
++    gst_object_unref (dev->video_pool);
++    dev->video_pool = NULL;
++  }
++
+   g_mutex_clear (&dev->vid->lock);
+   g_cond_clear (&dev->vid->cond);
+ 
+@@ -710,6 +832,14 @@ gst_droidcamsrc_dev_init (GstDroidCamSrcDev * dev)
+     droid_media_buffer_queue_set_callbacks (dev->queue, &cb, dev);
+   }
+ 
++  if (dev->recording_queue) {
++    DroidMediaBufferQueueCallbacks cb;
++    cb.buffers_released = gst_droidcamsrc_dev_recording_buffers_released;
++    cb.frame_available = gst_droidcamsrc_dev_recording_frame_available;
++    cb.buffer_created = gst_droidcamsrc_dev_recording_buffer_created;
++    droid_media_buffer_queue_set_callbacks (dev->recording_queue, &cb, dev);
++  }
++
+   gst_droidcamsrc_dev_update_params_locked (dev);
+ 
+   g_rec_mutex_unlock (dev->lock);
+@@ -870,6 +1000,7 @@ gst_droidcamsrc_dev_capture_image (GstDroidCamSrcDev * dev)
+ 
+   GST_DEBUG ("dev capture image");
+ 
++
+   if (src->post_preview) {
+     /*
+      * We must ensure that at least 1 preview buffer exists before proceed.
+@@ -911,6 +1042,56 @@ out:
+   return ret;
+ }
+ 
++
++gboolean
++gst_droidcamsrc_dev_configure_recording_pool (GstDroidCamSrcDev * dev,
++    GstVideoInfo * info)
++{
++  GstCaps *caps;
++  GstCapsFeatures *features;
++  GstStructure *config;
++  GstBufferPool *pool;
++  guint size;
++
++  if (!dev->recording_queue) {
++    GST_WARNING ("Cannot configure recording pool without recording queue");
++    return FALSE;
++  }
++
++  caps = gst_video_info_to_caps (info);
++  if (!caps)
++    return FALSE;
++
++  features = gst_caps_features_new (
++      GST_CAPS_FEATURE_MEMORY_DROID_MEDIA_QUEUE_BUFFER, NULL);
++  gst_caps_set_features (caps, 0, features);
++
++  pool = gst_droid_buffer_pool_new ();
++  size = info->size ? info->size : 1;
++  config = gst_buffer_pool_get_config (pool);
++  gst_buffer_pool_config_set_params (config, caps, size, 0,
++      droid_media_buffer_queue_length ());
++
++  if (!gst_buffer_pool_set_config (pool, config) ||
++      !gst_buffer_pool_set_active (pool, TRUE)) {
++    GST_WARNING ("Failed to configure recording buffer pool");
++    gst_object_unref (pool);
++    gst_caps_unref (caps);
++    return FALSE;
++  }
++
++  g_rec_mutex_lock (dev->lock);
++  if (dev->video_pool) {
++    gst_buffer_pool_set_active (dev->video_pool, FALSE);
++    gst_object_unref (dev->video_pool);
++  }
++  dev->video_pool = pool;
++  g_rec_mutex_unlock (dev->lock);
++
++  gst_caps_unref (caps);
++  return TRUE;
++}
++
+ gboolean
+ gst_droidcamsrc_dev_start_video_recording (GstDroidCamSrcDev * dev)
+ {
+@@ -991,9 +1172,21 @@ gst_droidcamsrc_dev_stop_video_recording (GstDroidCamSrcDev * dev)
+ 
+   /* We need to make sure that some buffers have been pushed */
+   g_mutex_lock (&dev->vid->lock);
+-  while (dev->vid->video_frames <= 4) {
+-    g_cond_wait (&dev->vid->cond, &dev->vid->lock);
++
++
++  {
++    gint64 end_time = g_get_monotonic_time () + (2 * G_TIME_SPAN_SECOND);
++
++    while (dev->vid->video_frames <= 4) {
++
++      if (!g_cond_wait_until (&dev->vid->cond, &dev->vid->lock, end_time)) {
++        GST_WARNING ("Timed out waiting for video recording frames");
++        break;
++      }
++    }
+   }
++
++
+   g_mutex_unlock (&dev->vid->lock);
+ 
+   /* Now stop pushing to the pad */
+@@ -1017,6 +1210,7 @@ gst_droidcamsrc_dev_stop_video_recording (GstDroidCamSrcDev * dev)
+     GST_ERROR ("failed to push EOS event");
+   }
+ 
++
+   if (!dev->use_recorder) {
+     g_rec_mutex_lock (dev->lock);
+ 
+diff --git a/gst/droidcamsrc/gstdroidcamsrcdev.h b/gst/droidcamsrc/gstdroidcamsrcdev.h
+index bfa4726..d9ef489 100644
+--- a/gst/droidcamsrc/gstdroidcamsrcdev.h
++++ b/gst/droidcamsrc/gstdroidcamsrcdev.h
+@@ -41,6 +41,7 @@ struct _GstDroidCamSrcDev
+ {
+   DroidMediaCamera *cam;
+   DroidMediaBufferQueue *queue;
++  DroidMediaBufferQueue *recording_queue;
+   GstDroidCamSrcParams *params;
+   GstDroidCamSrcPad *vfsrc;
+   GstDroidCamSrcPad *imgsrc;
+@@ -54,6 +55,7 @@ struct _GstDroidCamSrcDev
+   GstDroidCamSrcImageCaptureState *img;
+   GstDroidCamSrcVideoCaptureState *vid;
+   GstBufferPool *pool;
++  GstBufferPool *video_pool;
+   DroidMediaCameraConstants c;
+   GstVideoFormat viewfinder_format;
+ 
+@@ -84,6 +86,8 @@ gboolean gst_droidcamsrc_dev_set_params (GstDroidCamSrcDev * dev);
+ gboolean gst_droidcamsrc_dev_capture_image (GstDroidCamSrcDev * dev);
+ 
+ gboolean gst_droidcamsrc_dev_start_video_recording (GstDroidCamSrcDev * dev);
++gboolean gst_droidcamsrc_dev_configure_recording_pool (GstDroidCamSrcDev * dev,
++                                                        GstVideoInfo * info);
+ void gst_droidcamsrc_dev_stop_video_recording (GstDroidCamSrcDev * dev);
+ 
+ void gst_droidcamsrc_dev_update_params (GstDroidCamSrcDev * dev);
+diff --git a/gst/droidcodec/gstdroidvenc.c b/gst/droidcodec/gstdroidvenc.c
+index 8fb4ff3..8362555 100644
+--- a/gst/droidcodec/gstdroidvenc.c
++++ b/gst/droidcodec/gstdroidvenc.c
+@@ -130,19 +130,26 @@ gst_droidvenc_create_codec (GstDroidVEnc * enc)
+       enc->in_state->info.width, enc->in_state->info.height,
+       enc->target_bitrate);
+ 
++
+   memset (&md, 0x0, sizeof (md));
+ 
+   md.parent.type = droid;
+   md.parent.width = enc->in_state->info.width;
+   md.parent.height = enc->in_state->info.height;
+   md.parent.fps = enc->in_state->info.fps_n / enc->in_state->info.fps_d;        // TODO: bad
+-  md.parent.flags = DROID_MEDIA_CODEC_HW_ONLY;
++  /*
++   * Android 14 hybris reports no matching codecs when
++   * MediaCodecList::kHardwareCodecsOnly is requested, even though H.264 is
++   * available through the normal codec selection path.  Do not apply the
++   * broken HW_ONLY filter here; let MediaCodec select the encoder.
++   */
++  md.parent.flags = 0;
+   md.bitrate = enc->target_bitrate;
+   md.stride = enc->in_state->info.width;
+   md.slice_height = enc->in_state->info.height;
+ 
+   /* TODO: get this from caps */
+-  md.meta_data = true;
++  md.meta_data = GST_DROID_VIDEO_METADATA_TYPE_ANW_BUFFER;
+ 
+   query = gst_droid_query_new_video_color_format ();
+   if (!gst_pad_peer_query (GST_VIDEO_ENCODER_SINK_PAD (GST_VIDEO_ENCODER (enc)),
+@@ -172,6 +179,7 @@ gst_droidvenc_create_codec (GstDroidVEnc * enc)
+ 
+   {
+     DroidMediaCodecCallbacks cb;
++    memset (&cb, 0x0, sizeof (cb));
+     cb.signal_eos = gst_droidvenc_signal_eos;
+     cb.error = gst_droidvenc_error;
+     droid_media_codec_set_callbacks (enc->codec, &cb, enc);
+@@ -586,7 +594,11 @@ gst_droidvenc_handle_frame (GstVideoEncoder * encoder,
+     enc->dirty = FALSE;
+   }
+ 
+-  gst_buffer_map (frame->input_buffer, &info, GST_MAP_READ);
++  if (!gst_buffer_map (frame->input_buffer, &info, GST_MAP_READ)) {
++    goto error;
++  }
++
++
+   data.data.size = info.size;
+   data.data.data = info.data;
+   data.sync = false;

@@ -1,0 +1,18 @@
+# sailfish-xperia-10v-tweaks: optional early camera binary bind mount
+[Unit]
+Description=Xperia 10 V patched camera binaries (optional bind mount)
+Documentation=https://github.com/balta3/sailfish-xperia-10v-tweaks
+DefaultDependencies=no
+After=local-fs.target
+Before=droid-hal-init.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /root/sailfish-xperia-10v-tweaks/mount-camera-binaries.sh apply
+TimeoutStartSec=10s
+RemainAfterExit=yes
+
+[Install]
+WantedBy=droid-hal-init.service

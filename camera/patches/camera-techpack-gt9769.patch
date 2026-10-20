@@ -1,0 +1,49 @@
+diff --git a/drivers/cam_sensor_module/cam_actuator/cam_actuator_core.c b/drivers/cam_sensor_module/cam_actuator/cam_actuator_core.c
+index 722f91e3..f954de5a 100644
+--- a/drivers/cam_sensor_module/cam_actuator/cam_actuator_core.c
++++ b/drivers/cam_sensor_module/cam_actuator/cam_actuator_core.c
+@@ -260,6 +260,44 @@ int32_t cam_actuator_apply_settings(struct cam_actuator_ctrl_t *a_ctrl,
+ 		return -EINVAL;
+ 	}
+ 
++	if (a_ctrl->soc_info.index == 3 &&
++		a_ctrl->io_master_info.master_type == CCI_MASTER &&
++		a_ctrl->io_master_info.cci_client &&
++		a_ctrl->io_master_info.cci_client->cci_device == 1 &&
++		a_ctrl->io_master_info.cci_client->cci_i2c_master == 0 &&
++		a_ctrl->io_master_info.cci_client->sid == 0x0e &&
++		!list_empty(&i2c_set->list_head)) {
++		struct i2c_settings_list *first;
++		struct cam_sensor_i2c_reg_setting *settings;
++		uint32_t reg00 = 0;
++		int read_rc;
++
++		first = list_first_entry(&i2c_set->list_head,
++			struct i2c_settings_list, list);
++		settings = &first->i2c_settings;
++		if (settings->reg_setting &&
++			settings->addr_type == CAMERA_SENSOR_I2C_TYPE_BYTE &&
++			settings->data_type == CAMERA_SENSOR_I2C_TYPE_BYTE &&
++			settings->size == 4 &&
++			settings->reg_setting[0].reg_addr == 0x00 &&
++			settings->reg_setting[0].reg_data == 0x00 &&
++			settings->reg_setting[1].reg_addr == 0x02 &&
++			settings->reg_setting[1].reg_data == 0x02 &&
++			settings->reg_setting[2].reg_addr == 0x06 &&
++			settings->reg_setting[2].reg_data == 0x61 &&
++			settings->reg_setting[3].reg_addr == 0x07 &&
++			settings->reg_setting[3].reg_data == 0x39) {
++			read_rc = camera_io_dev_read(&a_ctrl->io_master_info,
++				0x00, &reg00,
++				CAMERA_SENSOR_I2C_TYPE_BYTE,
++				CAMERA_SENSOR_I2C_TYPE_BYTE);
++			if (read_rc < 0)
++				CAM_WARN(CAM_ACTUATOR,
++					"PDX235 GT9769 init pre-read failed: %d",
++					read_rc);
++		}
++	}
++
+ 	list_for_each_entry(i2c_list,
+ 		&(i2c_set->list_head), list) {
+ 		rc = cam_actuator_i2c_modes_util(
